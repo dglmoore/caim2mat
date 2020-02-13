@@ -1,0 +1,188 @@
+#!/usr/bin/env python
+
+import argparse
+import json
+import numpy as np
+import os.path as path
+import re
+import sys
+import xlsxwriter
+
+
+DATAFIELD = {'value': 'y',
+             'pvalue': ('sig', 'p'),
+             'standarderror': ('sig', 'se')}
+
+JSONRE = re.compile(r"\.json$")
+
+
+def readjson(fname):
+    with open(fname, 'r') as handle:
+        try:
+            return json.load(handle)
+        except Exception as e:
+            msg = 'invalid JSON formating; {}\n{}'
+            raise(Exception(msg.format(fname, e.msg)))
+
+
+def outname(fname, name, suffix, force=False):
+    if name is None:
+        if JSONRE.search(fname) is None:
+            dst = path.basename(fname) + suffix
+        else:
+            dst = JSONRE.sub(suffix, path.basename(fname))
+    else:
+        dst = name + suffix
+
+    if path.exists(dst) and not force:
+        msg = 'file "{}" already exists; consider passing --force argument'
+        raise(SystemError(msg.format(dst)))
+
+    return dst
+
+
+def savecsv(fname, fields, name=None, force=False):
+    data = readjson(fname)
+
+    for field in fields:
+        suffix = '_' + field + '.csv'
+        dst = outname(fname, name, suffix, force=force)
+
+        subdata = extract(data, DATAFIELD[field])
+        np.savetxt(dst, subdata, delimiter=',')
+
+
+def saveexcel(fname, fields, name=None, force=False):
+    data = readjson(fname)
+    dst = outname(fname, name, '.xlsx', force=force)
+
+    workbook = xlsxwriter.Workbook(dst)
+    for field in fields:
+        worksheet = workbook.add_worksheet(field)
+        subdata = extract(data, DATAFIELD[field])
+        if subdata.ndim == 1:
+            for (i,), value in np.ndenumerate(subdata):
+                worksheet.write_number(i, 0, value)
+        elif subdata.ndim == 2:
+            for (i, j), value in np.ndenumerate(subdata):
+                worksheet.write_number(i, j, value)
+        else:
+            raise(Exception('data must be either 1- or 2-d'))
+    workbook.close()
+
+
+CONVERTER = {'csv': savecsv, 'excel': saveexcel}
+
+
+def extract(data, fields):
+    if isinstance(fields, str):
+        fields = [fields]
+    elif not isinstance(fields, (list, tuple)):
+        raise(TypeError('field specification must be a string or a tuple'))
+    elif len(fields) == 0:
+        raise(ValueError('field specification must not be empty'))
+
+    sources, targets, values = [], [], []
+    for row in data:
+        if 'source' in row:
+            sources.append(row['source']['name'])
+        if 'target' in row:
+            targets.append(row['target']['name'])
+        value = row
+        for field in fields:
+            value = value[field]
+        values.append(value)
+
+    if len(sources) == 0 and len(targets) == 0:
+        e = Exception('file does not appear to have been exported from Caim')
+        raise(e)
+    elif len(targets) == 0:
+        matrix = np.zeros(len(sources))
+        for s, v in zip(sources, values):
+            matrix[s] = v
+    elif len(sources) == 0:
+        matrix = np.zeros(len(targets))
+        for t, v in zip(targets, values):
+            matrix[t] = v
+    else:
+        N = np.max(sources) + 1
+        isupper = np.greater_equal(sources, targets).all()
+        islower = np.less_equal(sources, targets).all()
+
+        matrix = np.zeros((N, N))
+        for s, t, v in zip(sources, targets, values):
+            matrix[s, t] = v
+            if isupper or islower:
+                matrix[t, s] = v
+
+    return matrix
+
+
+def main():
+    parser = argparse.ArgumentParser(description='''Convert Caim output files
+                                                    to CSV or Excel format''')
+
+    parser.add_argument('input', metavar='FILE', type=str,
+                        help='path to JSON file')
+
+    parser.add_argument('--name', '-n', help='''name of output files,
+                                                defaults to the name of the
+                                                input file''')
+
+    parser.add_argument('--csv', '-c', action='store_true',
+                        help='output CSV files; one per data field')
+    parser.add_argument('--excel', '-e', action='store_true',
+                        help='output Excel file; one worksheet per data field')
+
+    parser.add_argument('--value', '-v', action='store_true',
+                        help='export the value field')
+    parser.add_argument('--pvalue', '-p', action='store_true',
+                        help='export the p-values')
+    parser.add_argument('--standarderror', '-s', action='store_true',
+                        help='export the standard error')
+    parser.add_argument('--all', '-a', action='store_true',
+                        help='export all fields')
+
+    parser.add_argument('--force', '-f', action='store_true',
+                        help='''force overwriting if a file with the same name
+                                 as an output file already exists''')
+
+    args = parser.parse_args()
+
+    if JSONRE.search(args.input) is None:
+        msg = 'WARNING: input file {} doesn\'t have .json extension\n'
+        sys.stderr.write(msg.format(args.input))
+
+    if not args.csv and not args.excel:
+        args.csv = True
+
+    if not args.value and not args.pvalue and not args.standarderror:
+        args.value = True
+
+    if args.all:
+        args.value = args.pvalue = args.standarderror = True
+
+    fmts = []
+    if args.csv:
+        fmts.append('csv')
+    if args.excel:
+        fmts.append('excel')
+
+    fields = []
+    if args.value:
+        fields.append('value')
+    if args.pvalue:
+        fields.append('pvalue')
+    if args.standarderror:
+        fields.append('standarderror')
+
+    for fmt in fmts:
+        CONVERTER[fmt](args.input, fields, name=args.name, force=args.force)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        sys.stderr.write('Error: ' + str(e) + '\n')
+        sys.exit(1)
